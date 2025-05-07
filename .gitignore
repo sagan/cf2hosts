@@ -1,0 +1,4 @@
+*.exe
+/cf2hosts
+/.local
+/dist
