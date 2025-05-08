@@ -16,19 +16,21 @@ import (
 	"sync" // For concurrent CNAME resolution
 
 	"github.com/cloudflare/cloudflare-go" // Official Cloudflare Go SDK
+	"github.com/sagan/cf2hosts/util"
 )
 
-const VERSION = "v0.1.0"
+const VERSION = "v0.2.0"
 
 // --- Configuration Variables ---
 var (
-	cfAPIToken string
-	cfZoneID   string
-	domain     string
-	saveSRVDir string
-	identifier string
-	dryRun     bool
-	verbose    bool // Optional: for more detailed output
+	cfAPIToken    string
+	cfZoneID      string
+	domain        string
+	saveSRVDir    string
+	identifier    string
+	hostsFilePath string
+	dryRun        bool
+	verbose       bool // Optional: for more detailed output
 )
 
 // --- Hosts File Delimiters ---
@@ -41,76 +43,77 @@ func main() {
 	fmt.Printf("cf2hosts %s\n", VERSION)
 	// 1. Parse Command Line Flags and Environment Variables
 	setupConfig()
-
 	if dryRun {
-		fmt.Println("--- DRY RUN MODE ENABLED ---")
+		fmt.Printf("--- DRY RUN MODE ENABLED ---\n")
 	}
 	if verbose {
-		fmt.Println("Verbose mode enabled.")
+		fmt.Printf("Verbose mode enabled.\n")
 	}
 
 	// 2. Initialize Cloudflare API Client
 	api, err := newCloudflareClient()
 	if err != nil {
-		logError("Error creating Cloudflare client: %v", err)
-		os.Exit(1)
+		log.Fatalf("Error creating Cloudflare client: %v", err)
 	}
 
 	// 3. Fetch DNS Records
 	if verbose {
-		fmt.Printf("Fetching DNS records for zone ID '%s' and domain '%s'...\n", cfZoneID, domain)
+		log.Printf("Fetching DNS records for zone ID %q and domain %q", cfZoneID, domain)
 	}
 	records, err := fetchDNSRecords(api)
 	if err != nil {
-		logError("Error fetching DNS records: %v", err)
-		os.Exit(1)
+		log.Fatalf("Error fetching DNS records: %v", err)
 	}
+	for _, record := range records {
+		record.Name = strings.ToLower(record.Name)
+	}
+	recordIps := resolveIps(records)
 
 	if verbose {
-		fmt.Printf("Found %d DNS records.\n", len(records))
+		log.Printf("Found %d DNS records.", len(records))
 	}
 
 	// 4. Process Records
-	var aRecords []cloudflare.DNSRecord
 	var cnameRecords []cloudflare.DNSRecord
 	var srvRecords []cloudflare.DNSRecord
 
 	domains := strings.Split(domain, ",")
 
+	// 5. Handle A and CNAME Records (Update Hosts File)
+	hostsEntries := make(map[string]string) // domain -> ip
+	failedEntries := make(map[string]bool)
+
 	for _, r := range records {
-		r.Name = strings.ToLower(r.Name)
 		// Filter for the specific domain or subdomains
-		if slices.ContainsFunc(domains, func(domain string) bool {
+		if !slices.ContainsFunc(domains, func(domain string) bool {
 			if !strings.HasPrefix(domain, ".") {
 				domain = "." + domain
 			}
 			return strings.HasSuffix(r.Name, domain)
 		}) {
-			switch r.Type {
-			case "A":
-				aRecords = append(aRecords, r)
-			case "CNAME":
-				cnameRecords = append(cnameRecords, r)
-			case "SRV":
-				srvRecords = append(srvRecords, r)
+			continue
+		}
+		switch r.Type {
+		case "A":
+			hostsEntries[r.Name] = r.Content
+			if verbose {
+				log.Printf("[A Record] %s -> %s", r.Name, r.Content)
 			}
+		case "CNAME":
+			if ip, ok := recordIps[r.Name]; ok {
+				hostsEntries[r.Name] = ip
+				if verbose {
+					log.Printf("[self-resolved CNAME Record] %s -> %s", r.Name, ip)
+				}
+			} else {
+				cnameRecords = append(cnameRecords, r)
+			}
+		case "SRV":
+			srvRecords = append(srvRecords, r)
 		}
 	}
-
 	if verbose {
-		fmt.Printf("Filtered records: %d A, %d CNAME, %d SRV\n", len(aRecords), len(cnameRecords), len(srvRecords))
-	}
-
-	// 5. Handle A and CNAME Records (Update Hosts File)
-	hostsEntries := make(map[string]string) // domain -> ip
-	failedEntries := make(map[string]bool)
-
-	// Process A records
-	for _, r := range aRecords {
-		hostsEntries[r.Name] = r.Content
-		if verbose {
-			fmt.Printf("  [A Record] %s -> %s\n", r.Name, r.Content)
-		}
+		log.Printf("Filtered records: %d A, %d CNAME, %d SRV", len(hostsEntries), len(cnameRecords), len(srvRecords))
 	}
 
 	// Process CNAME records (resolve them)
@@ -122,7 +125,7 @@ func main() {
 		go func(record cloudflare.DNSRecord) {
 			defer wg.Done()
 			if verbose {
-				fmt.Printf("  Resolving CNAME: %s -> %s\n", record.Name, record.Content)
+				log.Printf("Resolving CNAME: %s -> %s", record.Name, record.Content)
 			}
 			// Attempt to resolve CNAME using Cloudflare's DNS (if possible via API)
 			// or fallback to system DNS or a specific resolver.
@@ -130,7 +133,7 @@ func main() {
 			// A more robust solution might involve querying Cloudflare's public DNS (1.1.1.1) directly.
 			ips, err := net.LookupIP(record.Content)
 			if err != nil {
-				logError("  Error resolving CNAME %s (%s): %v", record.Name, record.Content, err)
+				log.Printf("Error resolving CNAME %s (%s): %v", record.Name, record.Content, err)
 				mu.Lock()
 				failedEntries[record.Name] = true
 				mu.Unlock()
@@ -153,10 +156,10 @@ func main() {
 				hostsEntries[record.Name] = chosenIP
 				mu.Unlock()
 				if verbose {
-					fmt.Printf("  [CNAME Resolved] %s -> %s (%s)\n", record.Name, chosenIP, record.Content)
+					log.Printf("[CNAME Resolved] %s -> %s (%s)", record.Name, chosenIP, record.Content)
 				}
 			} else {
-				logError("  Could not resolve CNAME %s (%s) to any IP address", record.Name, record.Content)
+				log.Printf("Could not resolve CNAME %s (%s) to any IP address", record.Name, record.Content)
 			}
 		}(r)
 	}
@@ -164,25 +167,25 @@ func main() {
 
 	if len(hostsEntries) > 0 {
 		if err := updateHostsFile(hostsEntries, failedEntries); err != nil {
-			logError("Error updating hosts file: %v", err)
+			log.Printf("Error updating hosts file: %v", err)
 		}
 	} else if verbose {
-		fmt.Println("No A or resolvable CNAME records found to update hosts file.")
+		log.Printf("No A or resolvable CNAME records found to update hosts file.")
 	}
 
 	// 6. Handle SRV Records (Save to ipset files)
 	if saveSRVDir != "" && len(srvRecords) > 0 {
-		if err := saveSRVRecords(srvRecords, api); err != nil { // Pass API to resolve SRV targets if needed
-			logError("Error saving SRV records: %v", err)
+		if err := saveSRVRecords(srvRecords, recordIps); err != nil { // Pass API to resolve SRV targets if needed
+			log.Printf("Error saving SRV records: %v", err)
 		}
 	} else if saveSRVDir != "" && verbose {
-		fmt.Println("No SRV records found to save or 'save-srv-dir' not provided.")
+		log.Printf("No SRV records found to save or 'save-srv-dir' not provided.")
 	}
 
 	if dryRun {
-		fmt.Println("--- DRY RUN COMPLETED ---")
+		fmt.Printf("--- DRY RUN COMPLETED ---\n")
 	} else {
-		fmt.Println("Program completed successfully.")
+		fmt.Printf("Program completed successfully.\n")
 	}
 }
 
@@ -193,6 +196,7 @@ func setupConfig() {
 	cfAPIToken = os.Getenv("CLOUDFLARE_API_TOKEN")
 	cfZoneID = os.Getenv("CLOUDFLARE_ZONE_ID")
 	identifier = os.Getenv("IDENTIFIER")
+	hostsFilePath = os.Getenv("HOSTS_FILE")
 	domain = os.Getenv("CLOUDFLARE_DOMAIN")
 	saveSRVDir = os.Getenv("SAVE_SRV_DIR")
 
@@ -201,27 +205,27 @@ func setupConfig() {
 	flag.StringVar(&cfZoneID, "zone-id", cfZoneID, "Cloudflare Zone ID (env: CLOUDFLARE_ZONE_ID)")
 	flag.StringVar(&domain, "domain", domain, "Base domain/subdomain (or multiple comma separated domains) to manage (e.g., example.com) (env: CLOUDFLARE_DOMAIN)")
 	flag.StringVar(&saveSRVDir, "save-srv-dir", saveSRVDir, "Directory to save SRV records for ipset (optional) (env: SAVE_SRV_DIR)")
-	flag.StringVar(&identifier, "identifier", "", "Optional hosts file updating section identifier mark")
+	flag.StringVar(&identifier, "identifier", identifier, "Optional hosts file updating section identifier mark")
+	flag.StringVar(&hostsFilePath, "hosts-file", hostsFilePath, `Hosts file path. If not provided, will use current OS system hosts file`)
 	flag.BoolVar(&dryRun, "dry-run", false, "If true, no actual changes will be made")
 	flag.BoolVar(&verbose, "verbose", false, "Enable verbose output")
 
 	flag.Parse()
 
 	// Validations
-	if cfAPIToken == "" {
-		logError("Error: Cloudflare API Token must be provided.")
-		flag.Usage()
-		os.Exit(1)
+	if cfAPIToken == "" || cfZoneID == "" || domain == "" {
+		log.Fatalf("Error: Cloudflare API Token & Zone ID & domain must be provided.")
 	}
-	if cfZoneID == "" {
-		logError("Error: Cloudflare Zone ID must be provided.")
-		flag.Usage()
-		os.Exit(1)
-	}
-	if domain == "" {
-		logError("Error: Domain must be provided.")
-		flag.Usage()
-		os.Exit(1)
+
+	if hostsFilePath == "" {
+		var err error
+		hostsFilePath, err = getSystemHostsFilePath()
+		if err != nil {
+			log.Fatalf("Error getting hosts file path: %v", err)
+		}
+		if verbose {
+			log.Printf("Using hosts file: %s", hostsFilePath)
+		}
 	}
 	domain = strings.ToLower(domain)
 }
@@ -283,7 +287,7 @@ func fetchDNSRecords(api *cloudflare.API) ([]cloudflare.DNSRecord, error) {
 	return allRecords, nil
 }
 
-func getHostsFilePath() (string, error) {
+func getSystemHostsFilePath() (string, error) {
 	// OS-dependent hosts file path
 	switch runtime.GOOS {
 	case "windows":
@@ -296,19 +300,14 @@ func getHostsFilePath() (string, error) {
 }
 
 func updateHostsFile(entries map[string]string, failedEntries map[string]bool) error {
-	hostsFilePath, err := getHostsFilePath()
-	if err != nil {
-		return err
-	}
-
 	if verbose {
-		fmt.Printf("Updating hosts file: %s\n", hostsFilePath)
+		log.Printf("Updating hosts file: %s", hostsFilePath)
 	}
 
 	// Read existing hosts file content
-	file, err := os.OpenFile(hostsFilePath, os.O_RDWR, 0644) // Read-write permissions
+	file, err := os.OpenFile(hostsFilePath, os.O_RDWR|os.O_CREATE, 0644) // Read-write permissions
 	if err != nil {
-		return fmt.Errorf("could not open hosts file '%s' (run with sudo?): %w", hostsFilePath, err)
+		return fmt.Errorf("could not open hosts file %q (run with sudo?): %w", hostsFilePath, err)
 	}
 	defer file.Close()
 
@@ -362,15 +361,17 @@ func updateHostsFile(entries map[string]string, failedEntries map[string]bool) e
 		newRecordLines = append(newRecordLines, fmt.Sprintf("%s %s", ip, domain))
 	}
 	if slices.Equal(existingRecordLines, newRecordLines) {
-		fmt.Printf("Same contents as existing hosts file section, no need to update\n")
+		log.Printf("Same contents as existing hosts file, no need to update")
 		return nil
 	}
 
 	if dryRun {
-		fmt.Printf("  [Dry Run] Would update hosts file with the following entries:\n")
+		fmt.Printf("[Dry Run] Would update hosts file with the following entries:\n")
+		fmt.Printf("---\n")
 		for _, line := range newRecordLines {
 			fmt.Printf("%s\n", line)
 		}
+		fmt.Printf("---\n")
 		return nil
 	}
 
@@ -398,82 +399,48 @@ func updateHostsFile(entries map[string]string, failedEntries map[string]bool) e
 		return fmt.Errorf("error flushing writer for hosts file: %w", err)
 	}
 
-	fmt.Printf("Hosts file '%s' updated successfully.\n", hostsFilePath)
+	log.Printf("Hosts file %q updated successfully.", hostsFilePath)
 	return nil
 }
 
 // resolveSRVTarget resolves the target of an SRV record to IP addresses.
 // This is necessary because SRV records point to hostnames, not directly to IPs.
-func resolveSRVTarget(targetHostname string, api *cloudflare.API, zoneID string) ([]string, error) {
+// The returned resolved ip list is in order, the earlier the higher the priority.
+func resolveSRVTarget(targetHostname string, recordIps map[string]string) ([]string, error) {
 	var ips []string
-
-	// 1. Check if the target is an A/AAAA record within the same Cloudflare zone
-	// This part is a bit tricky as it requires another API call to find the A/AAAA record.
-	// We'll simplify by trying direct DNS lookup first, but a more robust CF-centric
-	// solution would query CF DNS records for the target.
-
-	// For now, we'll use net.LookupIP. A more advanced version could:
-	// a) Query Cloudflare for A/AAAA records matching targetHostname within the zoneID
-	// b) Use Cloudflare's 1.1.1.1 resolver for external domains
-
 	if verbose {
-		fmt.Printf("    Resolving SRV target: %s\n", targetHostname)
+		log.Printf("Resolving SRV target: %s\n", targetHostname)
 	}
-
-	resolvedIPs, err := net.LookupIP(targetHostname)
-	if err != nil {
-		// Fallback or specific error handling if needed
-		// Try to see if it's a record within our managed domain and we already resolved it.
-		// This is a simplification; a full CF lookup would be better.
-		rc := &cloudflare.ResourceContainer{Level: cloudflare.ZoneRouteLevel, Identifier: zoneID}
-		filter := cloudflare.ListDNSRecordsParams{Name: targetHostname}
-		targetRecords, _, listErr := api.ListDNSRecords(context.Background(), rc, filter)
-		if listErr == nil {
-			for _, rec := range targetRecords {
-				if rec.Type == "A" || rec.Type == "AAAA" {
-					ips = append(ips, rec.Content)
-					if verbose {
-						fmt.Printf("      Resolved SRV target %s to %s (via CF record)\n", targetHostname, rec.Content)
-					}
-				}
-			}
+	if ip, ok := recordIps[targetHostname]; ok {
+		ips = append(ips, ip)
+		if verbose {
+			log.Printf("Resolved SRV target %s to %s (via same zone records)", targetHostname, ip)
 		}
-		if len(ips) == 0 {
-			return nil, fmt.Errorf("could not resolve SRV target hostname '%s': %w", targetHostname, err)
-		}
-	} else {
+	} else if resolvedIPs, err := net.LookupIP(targetHostname); err == nil {
 		for _, ip := range resolvedIPs {
 			ips = append(ips, ip.String())
 			if verbose {
-				fmt.Printf("      Resolved SRV target %s to %s (via net.LookupIP)\n", targetHostname, ip.String())
+				log.Printf("Resolved SRV target %s to %s (via net.LookupIP)", targetHostname, ip.String())
 			}
 		}
 	}
-
 	if len(ips) == 0 {
-		return nil, fmt.Errorf("no IP addresses found for SRV target hostname '%s'", targetHostname)
+		return nil, fmt.Errorf("no IP addresses found for SRV target hostname %q", targetHostname)
 	}
 	return ips, nil
 }
 
-func saveSRVRecords(records []cloudflare.DNSRecord, cfApi *cloudflare.API) error {
+func saveSRVRecords(records []cloudflare.DNSRecord, recordIps map[string]string) error {
 	if saveSRVDir == "" {
 		return nil // Nothing to do
 	}
 
 	if verbose {
-		fmt.Printf("Processing SRV records for directory: %s\n", saveSRVDir)
+		log.Printf("Processing %d SRV records for directory: %s", len(records), saveSRVDir)
 	}
 
 	if _, err := os.Stat(saveSRVDir); os.IsNotExist(err) {
-		if !dryRun {
-			if err := os.MkdirAll(saveSRVDir, 0755); err != nil {
-				return fmt.Errorf("could not create SRV save directory '%s': %w", saveSRVDir, err)
-			}
-			fmt.Printf("Created directory: %s\n", saveSRVDir)
-		} else {
-			fmt.Printf("  [Dry Run] Would create directory: %s\n", saveSRVDir)
-		}
+		return fmt.Errorf("SRV save directory %q dones not exist: %w", saveSRVDir, err)
 	}
 
 	// Group SRV records by service name
@@ -487,30 +454,40 @@ func saveSRVRecords(records []cloudflare.DNSRecord, cfApi *cloudflare.API) error
 		if r.Type != "SRV" || r.Data == nil {
 			continue
 		}
-
-		log.Printf("srv data: %v", r.Data)
+		// port,priority,weight,target. target is string while others are float64
+		data, ok := r.Data.(map[string]any)
+		if !ok {
+			log.Printf("Invalid srv data format")
+			continue
+		}
+		log.Printf("srv data: %v", data)
+		targetHost := util.ToString(data["target"])
+		port := util.ToInt(data["port"])
+		if targetHost == "" || port == 0 {
+			log.Printf("Invalid srv target %q or port %d", targetHost, port)
+			continue
+		}
 
 		// r.Name is like _service._tcp.example.com
 		// r.SRVData.Target is the actual hostname providing the service
 		// r.SRVData.Port is the port number
 		matches := srvRegex.FindStringSubmatch(r.Name)
 		if len(matches) < 2 {
-			logError("  Could not parse service name from SRV record: %s", r.Name)
+			log.Printf("Could not parse service name from SRV record: %s", r.Name)
 			continue
 		}
 		serviceName := matches[1] // e.g., "sip" from "_sip._tcp.example.com"
-		targetHost := ""          // r.SRVData.Target
-		port := 21                //   r.SRVData.Port
+		proto := matches[2]       // e.g. "tcp"
 
 		if verbose {
-			fmt.Printf("  [SRV Record] %s -> Target: %s, Port: %d\n", r.Name, targetHost, port)
+			log.Printf("[SRV Record] %s -> Target: %s, Proto: %s, Port: %d", r.Name, targetHost, proto, port)
 		}
 
 		// Resolve the SRV target to an IP address(es)
 		// This is crucial as SRV records point to hostnames.
-		targetIPs, err := resolveSRVTarget(targetHost, cfApi, cfZoneID)
+		targetIPs, err := resolveSRVTarget(targetHost, recordIps)
 		if err != nil {
-			logError("  Error resolving SRV target '%s' for service '%s': %v", targetHost, serviceName, err)
+			log.Printf("Error resolving SRV target %q for service %q: %v", targetHost, serviceName, err)
 			continue // Skip this record if target cannot be resolved
 		}
 
@@ -519,15 +496,15 @@ func saveSRVRecords(records []cloudflare.DNSRecord, cfApi *cloudflare.API) error
 			// For simplicity, we'll focus on IPv4 here.
 			parsedIP := net.ParseIP(ip)
 			if parsedIP != nil && parsedIP.To4() != nil {
-				srvDataByService[serviceName] = append(srvDataByService[serviceName], fmt.Sprintf("%s,%d", ip, port))
+				srvDataByService[serviceName] = append(srvDataByService[serviceName], fmt.Sprintf("%s,%s:%d", ip, proto, port))
 			} else if parsedIP != nil && parsedIP.To16() != nil && parsedIP.To4() == nil {
 				// Could also handle IPv6 if ipset type is hash:ip6,port
 				if verbose {
-					fmt.Printf("    SRV target %s resolved to IPv6 %s, skipping for hash:ip,port ipset type.\n", targetHost, ip)
+					log.Printf("SRV target %s resolved to IPv6 %s, skipping for hash:ip,port ipset type.", targetHost, ip)
 				}
 			} else {
 				if verbose {
-					fmt.Printf("    SRV target %s resolved to '%s' which is not a valid IP, skipping.\n", targetHost, ip)
+					log.Printf("SRV target %s resolved to %q which is not a valid IP, skipping.", targetHost, ip)
 				}
 			}
 		}
@@ -537,35 +514,70 @@ func saveSRVRecords(records []cloudflare.DNSRecord, cfApi *cloudflare.API) error
 		if len(entries) == 0 {
 			continue
 		}
-		fileName := filepath.Join(saveSRVDir, service)                                                          // Use "service" as filename
-		ipsetFileContent := "create " + service + "_set hash:ip,port family inet hashsize 1024 maxelem 65536\n" // Example header
-		// Or, if the set is assumed to exist:
-		// ipsetFileContent := ""
 
+		fileName := filepath.Join(saveSRVDir, service+".ipset") // Use "service" as filename
+		ipsetFileContent := ""
 		for _, entry := range entries {
-			ipsetFileContent += fmt.Sprintf("add %s_set %s\n", service, entry)
+			ipsetFileContent += fmt.Sprintf("%s\n", entry)
+		}
+
+		if existingContents, err := os.ReadFile(fileName); err == nil {
+			if string(existingContents) == ipsetFileContent {
+				log.Printf("Same contents as existing ipset file %q, no need to update", fileName)
+				continue
+			}
 		}
 
 		if dryRun {
-			fmt.Printf("  [Dry Run] Would write to SRV file '%s':\n", fileName)
-			fmt.Println(strings.TrimSpace(ipsetFileContent))
-			fmt.Println("---")
+			fmt.Printf("[Dry Run] Would write to SRV ipset file %q:\n", fileName)
+			fmt.Printf("---\n")
+			fmt.Printf("%s\n", strings.TrimSpace(ipsetFileContent))
+			fmt.Printf("---\n")
 			continue
 		}
 
 		err := os.WriteFile(fileName, []byte(ipsetFileContent), 0644)
 		if err != nil {
-			logError("  Error writing SRV ipset file '%s': %v", fileName, err)
+			log.Printf("Error writing SRV ipset file %q: %v", fileName, err)
 		} else {
-			fmt.Printf("  SRV ipset data saved to: %s\n", fileName)
+			log.Printf("SRV ipset data saved to: %s\n", fileName)
 		}
 	}
 	return nil
 }
 
-func logError(format string, args ...interface{}) {
-	fmt.Fprintf(os.Stderr, "ERROR: "+format+"\n", args...)
-}
+// Extract all domain => ip records from CloudFlare DNS records.
+// Consider only A / AAAA & CNAME records.
+// For A / AAAA record, use it's ip content.
+// For CNAME records, if the target name itself exists in records as a A / CNAME, use the resolved ip.
+// If the final cname target name doesn't exist in records, ignore it.
+func resolveIps(records []cloudflare.DNSRecord) map[string]string {
+	result := make(map[string]string)
+	cnameTargets := make(map[string]string)
 
-// --- Entry Point ---
-// (main function is above)
+	for _, record := range records {
+		switch record.Type {
+		case "A", "AAAA":
+			result[record.Name] = record.Content
+		case "CNAME":
+			cnameTargets[record.Name] = record.Content
+		}
+	}
+
+outer:
+	for name, target := range cnameTargets {
+		for range 3 {
+			if ip, ok := result[target]; ok {
+				result[name] = ip
+				continue outer
+			}
+			if nextTarget, ok := cnameTargets[target]; ok {
+				target = nextTarget
+			} else {
+				continue outer
+			}
+		}
+	}
+
+	return result
+}
