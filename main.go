@@ -19,18 +19,22 @@ import (
 	"github.com/sagan/cf2hosts/util"
 )
 
-const VERSION = "v0.2.0"
+const VERSION = "v0.3.0"
 
 // --- Configuration Variables ---
 var (
-	cfAPIToken    string
-	cfZoneID      string
+	// Config: cloudflare API token
+	cfToken string
+	// Config: cloudflare DNS zone id
+	cfZone        string
 	domain        string
+	excludeDomain string
 	saveSRVDir    string
 	identifier    string
 	hostsFilePath string
 	dryRun        bool
-	verbose       bool // Optional: for more detailed output
+	// Optional config: for more detailed output
+	verbose bool
 )
 
 // --- Hosts File Delimiters ---
@@ -58,7 +62,7 @@ func main() {
 
 	// 3. Fetch DNS Records
 	if verbose {
-		log.Printf("Fetching DNS records for zone ID %q and domain %q", cfZoneID, domain)
+		log.Printf("Fetching DNS records for zone ID %q and domain %q", cfZone, domain)
 	}
 	records, err := fetchDNSRecords(api)
 	if err != nil {
@@ -78,6 +82,13 @@ func main() {
 	var srvRecords []cloudflare.DNSRecord
 
 	domains := strings.Split(domain, ",")
+	excludeDomains := strings.Split(excludeDomain, ",")
+	for i, d := range domains {
+		domains[i] = strings.TrimPrefix(d, ".")
+	}
+	for i, d := range excludeDomains {
+		excludeDomains[i] = strings.TrimPrefix(d, ".")
+	}
 
 	// 5. Handle A and CNAME Records (Update Hosts File)
 	hostsEntries := make(map[string]string) // domain -> ip
@@ -86,10 +97,9 @@ func main() {
 	for _, r := range records {
 		// Filter for the specific domain or subdomains
 		if !slices.ContainsFunc(domains, func(domain string) bool {
-			if !strings.HasPrefix(domain, ".") {
-				domain = "." + domain
-			}
-			return strings.HasSuffix(r.Name, domain)
+			return r.Name == domain || strings.HasSuffix(r.Name, "."+domain)
+		}) || slices.ContainsFunc(excludeDomains, func(domain string) bool {
+			return r.Name == domain || strings.HasSuffix(r.Name, "."+domain)
 		}) {
 			continue
 		}
@@ -193,28 +203,30 @@ func main() {
 
 func setupConfig() {
 	// Environment variables take precedence
-	cfAPIToken = os.Getenv("CLOUDFLARE_API_TOKEN")
-	cfZoneID = os.Getenv("CLOUDFLARE_ZONE_ID")
+	cfToken = os.Getenv("CF_TOKEN")
+	cfZone = os.Getenv("CF_ZONE")
 	identifier = os.Getenv("IDENTIFIER")
 	hostsFilePath = os.Getenv("HOSTS_FILE")
-	domain = os.Getenv("CLOUDFLARE_DOMAIN")
+	domain = os.Getenv("DOMAIN")
+	excludeDomain = os.Getenv("EXCLUDE_DOMAIN")
 	saveSRVDir = os.Getenv("SAVE_SRV_DIR")
 
 	// Command-line flags (can override env vars if desired, or just provide defaults)
-	flag.StringVar(&cfAPIToken, "cf-token", cfAPIToken, "Cloudflare API Token (env: CLOUDFLARE_API_TOKEN)")
-	flag.StringVar(&cfZoneID, "zone-id", cfZoneID, "Cloudflare Zone ID (env: CLOUDFLARE_ZONE_ID)")
-	flag.StringVar(&domain, "domain", domain, "Base domain/subdomain (or multiple comma separated domains) to manage (e.g., example.com) (env: CLOUDFLARE_DOMAIN)")
+	flag.StringVar(&cfToken, "cf-token", cfToken, "Cloudflare API Token (env: CF_TOKEN)")
+	flag.StringVar(&cfZone, "cf-zone", cfZone, "Cloudflare Zone ID (env: CF_ZONE)")
+	flag.StringVar(&domain, "domain", domain, "Base domain/subdomain (or multiple comma separated domains) to manage (e.g., example.com) (env: DOMAIN)")
+	flag.StringVar(&excludeDomain, "exclude-domain", excludeDomain, "Exclude domain/subdomain (or multiple comma separated domains) from management (e.g., exclude.example.com) (env: EXCLUDE_DOMAIN)")
 	flag.StringVar(&saveSRVDir, "save-srv-dir", saveSRVDir, "Directory to save SRV records for ipset (optional) (env: SAVE_SRV_DIR)")
-	flag.StringVar(&identifier, "identifier", identifier, "Optional hosts file updating section identifier mark")
-	flag.StringVar(&hostsFilePath, "hosts-file", hostsFilePath, `Hosts file path. If not provided, will use current OS system hosts file`)
+	flag.StringVar(&identifier, "identifier", identifier, "Optional hosts file updating section identifier mark (env: IDENTIFIER)")
+	flag.StringVar(&hostsFilePath, "hosts-file", hostsFilePath, `Hosts file path. If not provided, will use current OS system hosts file (env: HOSTS_FILE)`)
 	flag.BoolVar(&dryRun, "dry-run", false, "If true, no actual changes will be made")
 	flag.BoolVar(&verbose, "verbose", false, "Enable verbose output")
 
 	flag.Parse()
 
 	// Validations
-	if cfAPIToken == "" || cfZoneID == "" || domain == "" {
-		log.Fatalf("Error: Cloudflare API Token & Zone ID & domain must be provided.")
+	if cfToken == "" || cfZone == "" || domain == "" {
+		log.Fatalf("Error: cf-token & cf-zone & domain must be provided.")
 	}
 
 	if hostsFilePath == "" {
@@ -234,8 +246,8 @@ func newCloudflareClient() (*cloudflare.API, error) {
 	var api *cloudflare.API
 	var err error
 
-	if cfAPIToken != "" {
-		api, err = cloudflare.NewWithAPIToken(cfAPIToken)
+	if cfToken != "" {
+		api, err = cloudflare.NewWithAPIToken(cfToken)
 	} else {
 		return nil, fmt.Errorf("insufficient Cloudflare API credentials provided")
 	}
@@ -253,7 +265,7 @@ func fetchDNSRecords(api *cloudflare.API) ([]cloudflare.DNSRecord, error) {
 	// You might want to add pagination handling if you have a very large number of records.
 	// For simplicity, this example fetches records matching common types.
 	// You may need to adjust filtering based on your needs or fetch all and then filter.
-	rc := &cloudflare.ResourceContainer{Level: cloudflare.ZoneRouteLevel, Identifier: cfZoneID}
+	rc := &cloudflare.ResourceContainer{Level: cloudflare.ZoneRouteLevel, Identifier: cfZone}
 	filter := cloudflare.ListDNSRecordsParams{
 		Type: "A", // Initial fetch, can be expanded or fetched multiple times for different types
 	}

@@ -10,5 +10,5 @@ Mainly writen by Gemini 2.5 Pro
 # Run
 
 ```
-cf2hosts . -cf-token <token>  -zone-id <zone-id> -domain <example.com>
+cf2hosts . -cf-token <token> -cf-zone <zone-id> -domain <example.com>
 ```
