@@ -19,7 +19,7 @@ import (
 	"github.com/sagan/cf2hosts/util"
 )
 
-const VERSION = "v0.3.0"
+const VERSION = "v0.3.1"
 
 // --- Configuration Variables ---
 var (
@@ -97,10 +97,19 @@ func main() {
 	for _, r := range records {
 		// Filter for the specific domain or subdomains
 		if !slices.ContainsFunc(domains, func(domain string) bool {
+			if strings.HasPrefix(domain, "^") {
+				return r.Name == domain[1:]
+			}
 			return r.Name == domain || strings.HasSuffix(r.Name, "."+domain)
 		}) || slices.ContainsFunc(excludeDomains, func(domain string) bool {
+			if strings.HasPrefix(domain, "^") {
+				return r.Name == domain[1:]
+			}
 			return r.Name == domain || strings.HasSuffix(r.Name, "."+domain)
-		}) {
+		}) || strings.HasPrefix(r.Name, "*.") {
+			if verbose {
+				log.Printf("Ignore %q => %q record", r.Name, r.Content)
+			}
 			continue
 		}
 		switch r.Type {
@@ -110,7 +119,7 @@ func main() {
 				log.Printf("[A Record] %s -> %s", r.Name, r.Content)
 			}
 		case "CNAME":
-			if ip, ok := recordIps[r.Name]; ok {
+			if ip := getDomainIp(recordIps, r.Content); ip != "" {
 				hostsEntries[r.Name] = ip
 				if verbose {
 					log.Printf("[self-resolved CNAME Record] %s -> %s", r.Name, ip)
@@ -214,8 +223,8 @@ func setupConfig() {
 	// Command-line flags (can override env vars if desired, or just provide defaults)
 	flag.StringVar(&cfToken, "cf-token", cfToken, "Cloudflare API Token (env: CF_TOKEN)")
 	flag.StringVar(&cfZone, "cf-zone", cfZone, "Cloudflare Zone ID (env: CF_ZONE)")
-	flag.StringVar(&domain, "domain", domain, "Base domain/subdomain (or multiple comma separated domains) to manage (e.g., example.com) (env: DOMAIN)")
-	flag.StringVar(&excludeDomain, "exclude-domain", excludeDomain, "Exclude domain/subdomain (or multiple comma separated domains) from management (e.g., exclude.example.com) (env: EXCLUDE_DOMAIN)")
+	flag.StringVar(&domain, "domain", domain, `Base domain/subdomain (or multiple comma separated domains) to manage (e.g., example.com) (env: DOMAIN). If a domain in list has a "^" prefix, only the domain itself matches, otherwise the domain and all subdomains inside it matches`)
+	flag.StringVar(&excludeDomain, "exclude-domain", excludeDomain, `Exclude domain/subdomain (or multiple comma separated domains) from management (e.g., exclude.example.com) (env: EXCLUDE_DOMAIN). If a domain in list has a "^" prefix, only the domain itself matches, otherwise the domain and all subdomains inside it matches`)
 	flag.StringVar(&saveSRVDir, "save-srv-dir", saveSRVDir, "Directory to save SRV records for ipset (optional) (env: SAVE_SRV_DIR)")
 	flag.StringVar(&identifier, "identifier", identifier, "Optional hosts file updating section identifier mark (env: IDENTIFIER)")
 	flag.StringVar(&hostsFilePath, "hosts-file", hostsFilePath, `Hosts file path. If not provided, will use current OS system hosts file (env: HOSTS_FILE)`)
@@ -423,7 +432,7 @@ func resolveSRVTarget(targetHostname string, recordIps map[string]string) ([]str
 	if verbose {
 		log.Printf("Resolving SRV target: %s\n", targetHostname)
 	}
-	if ip, ok := recordIps[targetHostname]; ok {
+	if ip := getDomainIp(recordIps, targetHostname); ip != "" {
 		ips = append(ips, ip)
 		if verbose {
 			log.Printf("Resolved SRV target %s to %s (via same zone records)", targetHostname, ip)
@@ -572,19 +581,21 @@ func resolveIps(records []cloudflare.DNSRecord) map[string]string {
 		case "A", "AAAA":
 			result[record.Name] = record.Content
 		case "CNAME":
-			cnameTargets[record.Name] = record.Content
+			cnameTargets[record.Name] = strings.ToLower(record.Content) // Lowercase CNAME target
 		}
 	}
 
 outer:
 	for name, target := range cnameTargets {
 		for range 3 {
-			if ip, ok := result[target]; ok {
+			// 'target' is already lowercase because it was retrieved from cnameTargets,
+			// and values in cnameTargets are lowercased upon insertion.
+			if ip := getDomainIp(result, target); ip != "" {
 				result[name] = ip
 				continue outer
 			}
 			if nextTarget, ok := cnameTargets[target]; ok {
-				target = nextTarget
+				target = nextTarget // nextTarget is also already lowercase
 			} else {
 				continue outer
 			}
@@ -592,4 +603,24 @@ outer:
 	}
 
 	return result
+}
+
+// Get the ip of domain from records, which is the DNS domain => ip map.
+// Note: the key in records may be a wildcard name, like "*.example.com".
+// Saying the domain is "foo.bar.example.com":
+// If the "*.example.com" key exists in records, it's value should be used;
+// However, if both the "*.bar.example.com" and "*.example.com" keys exist in records, the former one take precedence.
+// Return the resolved IP for domain, or empty string if failed to resolve it.
+func getDomainIp(records map[string]string, domain string) string {
+	if ip, ok := records[domain]; ok {
+		return ip
+	}
+	parts := strings.Split(domain, ".")
+	for i := 1; i < len(parts); i++ {
+		wildcardDomain := "*." + strings.Join(parts[i:], ".")
+		if ip, ok := records[wildcardDomain]; ok {
+			return ip
+		}
+	}
+	return ""
 }
