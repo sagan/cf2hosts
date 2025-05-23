@@ -19,7 +19,7 @@ import (
 	"github.com/sagan/cf2hosts/util"
 )
 
-const VERSION = "v0.3.1"
+const VERSION = "v0.3.2"
 
 // --- Configuration Variables ---
 var (
@@ -70,6 +70,7 @@ func main() {
 	}
 	for _, record := range records {
 		record.Name = strings.ToLower(record.Name)
+		record.Content = strings.ToLower(record.Content)
 	}
 	recordIps := resolveIps(records)
 
@@ -114,6 +115,10 @@ func main() {
 		}
 		switch r.Type {
 		case "A":
+			if r.Content == "" || r.Content == "0.0.0.0" || r.Content == "255.255.255.255" {
+				log.Printf("Ignore empty or invalid %q => %q record", r.Name, r.Content)
+				continue
+			}
 			hostsEntries[r.Name] = r.Content
 			if verbose {
 				log.Printf("[A Record] %s -> %s", r.Name, r.Content)
@@ -581,7 +586,7 @@ func resolveIps(records []cloudflare.DNSRecord) map[string]string {
 		case "A", "AAAA":
 			result[record.Name] = record.Content
 		case "CNAME":
-			cnameTargets[record.Name] = strings.ToLower(record.Content) // Lowercase CNAME target
+			cnameTargets[record.Name] = record.Content
 		}
 	}
 
@@ -612,14 +617,27 @@ outer:
 // However, if both the "*.bar.example.com" and "*.example.com" keys exist in records, the former one take precedence.
 // Return the resolved IP for domain, or empty string if failed to resolve it.
 func getDomainIp(records map[string]string, domain string) string {
+	// Normalize domain: lowercase and remove trailing dot for consistent lookups.
+	// Keys in `records` (A/AAAA records, and resolved CNAMEs) are expected to be
+	// already lowercased and without trailing dots.
+	domain = strings.ToLower(domain)
+	domain = strings.TrimSuffix(domain, ".")
 	if ip, ok := records[domain]; ok {
 		return ip
 	}
 	parts := strings.Split(domain, ".")
 	for i := 1; i < len(parts); i++ {
-		wildcardDomain := "*." + strings.Join(parts[i:], ".")
+		zone := strings.Join(parts[i:], ".")
+		wildcardDomain := "*." + zone
 		if ip, ok := records[wildcardDomain]; ok {
 			return ip
+		}
+		// Make it consistent with DNS merchanism:
+		// If a "foo.example.com" record (technologically, any type is OK, even a TXT type) exists,
+		// The higher level "*.example.com" wildcard record will NOT affect query of "non-exist.foo.example.com",
+		// it will just return NXDOMAIN.
+		if _, ok := records[zone]; ok {
+			break // No more wildcards to check
 		}
 	}
 	return ""
